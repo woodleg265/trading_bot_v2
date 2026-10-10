@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "updated_at_utc": "2026-10-09T00:00:00+00:00",
+  "account_policy": {
+    "default_classification": "MANUAL_UNALLOCATED",
+    "bot_may_trade_unallocated_funds": false,
+    "reconciliation_required_before_trading": true
+  },
+  "bots": []
+}
