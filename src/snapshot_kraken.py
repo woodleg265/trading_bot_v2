@@ -10,8 +10,12 @@ from pathlib import Path
 import krakenex
 from dotenv import load_dotenv
 
-from audit_log import append_event
-
+try:
+    from .audit_log import append_event
+    from .trading_safety import atomic_write_json, set_reconciliation_required
+except ImportError:  # Supports direct execution: python src/snapshot_kraken.py
+    from audit_log import append_event
+    from trading_safety import atomic_write_json, set_reconciliation_required
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -28,19 +32,23 @@ def required_env(name: str) -> str:
 def is_nonzero(value: str) -> bool:
     try:
         return Decimal(value) != Decimal("0")
-    except InvalidOperation:
-        raise RuntimeError("Kraken returned an invalid numeric balance value.")
+    except InvalidOperation as exc:
+        raise RuntimeError("Kraken returned an invalid numeric balance value.") from exc
 
 
 def main() -> int:
     load_dotenv(ENV_FILE)
 
     if os.getenv("OBSERVATION_MODE", "").strip().lower() != "true":
-        print("SAFETY STOP: OBSERVATION_MODE must be true.", file=sys.stderr)
+        reason = "OBSERVATION_MODE must be true."
+        set_reconciliation_required(reason)
+        print(f"SAFETY STOP: {reason}", file=sys.stderr)
         return 1
 
     if os.getenv("TRADING_ENABLED", "").strip().lower() != "false":
-        print("SAFETY STOP: TRADING_ENABLED must be false.", file=sys.stderr)
+        reason = "TRADING_ENABLED must be false."
+        set_reconciliation_required(reason)
+        print(f"SAFETY STOP: {reason}", file=sys.stderr)
         return 1
 
     try:
@@ -60,6 +68,9 @@ def main() -> int:
             raise RuntimeError("; ".join(order_errors))
 
         balances = balance_response.get("result", {})
+        if not isinstance(balances, dict):
+            raise RuntimeError("Kraken returned an invalid balance response.")
+
         nonzero_balances = {
             asset: amount
             for asset, amount in balances.items()
@@ -67,8 +78,12 @@ def main() -> int:
         }
 
         open_orders = orders_response.get("result", {}).get("open", {})
+        if not isinstance(open_orders, dict):
+            raise RuntimeError("Kraken returned an invalid open-orders response.")
 
     except Exception as exc:
+        reason = f"Kraken observation snapshot failed: {exc}"
+        set_reconciliation_required(reason)
         append_event(
             "KRAKEN_SNAPSHOT_FAILED",
             {
@@ -80,12 +95,14 @@ def main() -> int:
         print(f"SNAPSHOT FAILED: {exc}", file=sys.stderr)
         return 1
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
     DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     snapshot_file = DATA_DIR / f"kraken_snapshot_{timestamp}.json"
 
     snapshot = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 1,
+        "timestamp_utc": now.isoformat(),
         "mode": "OBSERVATION_ONLY",
         "trading_enabled": False,
         "balances_nonzero": nonzero_balances,
@@ -93,11 +110,13 @@ def main() -> int:
         "open_orders": open_orders,
     }
 
-    with snapshot_file.open("x", encoding="utf-8") as handle:
-        json.dump(snapshot, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-    snapshot_file.chmod(0o600)
+    try:
+        atomic_write_json(snapshot_file, snapshot)
+    except OSError as exc:
+        reason = f"Could not safely write Kraken snapshot: {exc}"
+        set_reconciliation_required(reason)
+        print(f"SNAPSHOT FAILED: {reason}", file=sys.stderr)
+        return 1
 
     append_event(
         "KRAKEN_SNAPSHOT_CREATED",

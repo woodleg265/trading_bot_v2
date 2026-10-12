@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .trading_safety import set_reconciliation_required
+except ImportError:  # Supports direct execution: python src/run_observation.py
+    from trading_safety import set_reconciliation_required
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 LOG_DIR = PROJECT_ROOT / "logs"
+
+MAX_DIAGNOSTIC_CHARS = 2000
 
 STEPS = [
     ("snapshot", SRC_DIR / "snapshot_kraken.py"),
@@ -24,12 +29,38 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def safe_diagnostic(value: str) -> str:
+    value = value.replace("\x00", "")
+    lines: list[str] = []
+
+    for line in value.splitlines():
+        upper = line.upper()
+        if any(
+            marker in upper
+            for marker in (
+                "KRAKEN_API_KEY",
+                "KRAKEN_API_SECRET",
+                "API_KEY=",
+                "API_SECRET=",
+                "AUTHORIZATION:",
+                "BEARER ",
+            )
+        ):
+            lines.append("[redacted sensitive diagnostic line]")
+        else:
+            lines.append(line)
+
+    result = "\n".join(lines)
+    if len(result) > MAX_DIAGNOSTIC_CHARS:
+        return result[:MAX_DIAGNOSTIC_CHARS] + "\n[truncated]"
+    return result
+
+
 def write_audit_event(event: dict[str, Any]) -> Path:
     LOG_DIR.mkdir(mode=0o700, exist_ok=True)
     LOG_DIR.chmod(0o700)
 
     audit_file = LOG_DIR / "observation_runner.jsonl"
-
     with audit_file.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, sort_keys=True))
         handle.write("\n")
@@ -79,6 +110,8 @@ def run_step(name: str, script: Path) -> dict[str, Any]:
         "script": str(script.relative_to(PROJECT_ROOT)),
         "status": "PASSED" if result.returncode == 0 else "FAILED",
         "return_code": result.returncode,
+        "stdout": safe_diagnostic(result.stdout),
+        "stderr": safe_diagnostic(result.stderr),
     }
 
 
@@ -96,6 +129,8 @@ def main() -> int:
         step_results.append(result)
 
         if result["status"] != "PASSED":
+            reason = f"Observation run failed during {name}."
+            set_reconciliation_required(reason)
             print(f"{name}: FAILED")
             if "error" in result:
                 print(f"- {result['error']}")
@@ -129,13 +164,11 @@ def main() -> int:
     }
 
     audit_file = write_audit_event(event)
-
     print()
     print("Observation run completed successfully.")
     print("Trading permitted: False")
     print("Order submission attempted: False")
     print(f"Audit event recorded: {audit_file.relative_to(PROJECT_ROOT)}")
-
     return 0
 
 
