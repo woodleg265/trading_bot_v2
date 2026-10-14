@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -41,7 +41,12 @@ def _is_sensitive_key(key: str) -> bool:
 def _sanitize(value: Any) -> Any:
     """Convert values to deterministic JSON-safe, non-sensitive structures."""
     if is_dataclass(value) and not isinstance(value, type):
-        return _sanitize(asdict(value))
+        return _sanitize(
+            {
+                field.name: getattr(value, field.name)
+                for field in fields(value)
+            }
+        )
 
     if isinstance(value, Decimal):
         return str(value)
