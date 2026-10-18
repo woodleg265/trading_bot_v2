@@ -1,4 +1,4 @@
-"""Pure, offline EMA/RSI/ADX regime strategy.
+"""Pure, offline long-only EMA/RSI/ADX regime strategy.
 
 This module intentionally has no exchange, credential, network, file-system,
 or order-execution dependencies. It evaluates only the closed candles supplied
@@ -69,15 +69,74 @@ class StrategyDecision:
 
 @dataclass(frozen=True)
 class StrategySettings:
+    """Configuration for the long-only closed-candle regime strategy."""
+
     fast_ema_period: int = 12
     slow_ema_period: int = 26
     long_ema_period: int = 200
     rsi_period: int = 14
-    rsi_buy_ceiling_bull: float = 60.0
-    rsi_buy_ceiling_bear: float = 40.0
-    rsi_sell_threshold: float = 70.0
+    rsi_entry_floor: float = 50.0
+    rsi_entry_ceiling: float = 65.0
+    rsi_exit_threshold: float = 70.0
     adx_period: int = 14
+    adx_entry_threshold: float = 20.0
     crash_adx_threshold: float = 25.0
+
+    def __post_init__(self) -> None:
+        periods = (
+            self.fast_ema_period,
+            self.slow_ema_period,
+            self.long_ema_period,
+            self.rsi_period,
+            self.adx_period,
+        )
+
+        if any(period <= 0 for period in periods):
+            raise ValueError("All indicator periods must be positive.")
+
+        if self.fast_ema_period >= self.slow_ema_period:
+            raise ValueError(
+                "fast_ema_period must be less than slow_ema_period."
+            )
+
+        if self.slow_ema_period >= self.long_ema_period:
+            raise ValueError(
+                "slow_ema_period must be less than long_ema_period."
+            )
+
+        rsi_thresholds = (
+            self.rsi_entry_floor,
+            self.rsi_entry_ceiling,
+            self.rsi_exit_threshold,
+        )
+
+        if any(not isfinite(value) for value in rsi_thresholds):
+            raise ValueError("RSI thresholds must be finite.")
+
+        if not 0.0 <= self.rsi_entry_floor < self.rsi_entry_ceiling <= 100.0:
+            raise ValueError(
+                "RSI entry thresholds must satisfy "
+                "0 <= floor < ceiling <= 100."
+            )
+
+        if not 0.0 <= self.rsi_exit_threshold <= 100.0:
+            raise ValueError("rsi_exit_threshold must be between 0 and 100.")
+
+        if (
+            not isfinite(self.adx_entry_threshold)
+            or self.adx_entry_threshold < 0.0
+        ):
+            raise ValueError(
+                "adx_entry_threshold must be finite and non-negative."
+            )
+
+        if (
+            not isfinite(self.crash_adx_threshold)
+            or self.crash_adx_threshold < 0.0
+        ):
+            raise ValueError(
+                "crash_adx_threshold must be finite and non-negative."
+            )
 
 
 def ema(values: Sequence[float], period: int) -> list[float]:
@@ -156,12 +215,7 @@ def directional_movement(
     previous: Candle,
     current: Candle,
 ) -> tuple[float, float, float]:
-    """Return true range, positive DM, and negative DM.
-
-    Negative directional movement is calculated as previous low minus current
-    low. This is important: using current low minus previous low incorrectly
-    suppresses downward directional movement.
-    """
+    """Return true range, positive DM, and negative DM."""
 
     upward_move = current.high - previous.high
     downward_move = previous.low - current.low
@@ -218,7 +272,11 @@ def adx(
     for candle_index in range(period, length):
         if candle_index > period:
             source_index = candle_index - 1
-            smoothed_tr = smoothed_tr - (smoothed_tr / period) + true_ranges[source_index]
+            smoothed_tr = (
+                smoothed_tr
+                - (smoothed_tr / period)
+                + true_ranges[source_index]
+            )
             smoothed_plus_dm = (
                 smoothed_plus_dm
                 - (smoothed_plus_dm / period)
@@ -241,7 +299,11 @@ def adx(
         minus_di_values[candle_index] = minus_di
 
         denominator = plus_di + minus_di
-        dx = 0.0 if denominator == 0.0 else 100.0 * abs(plus_di - minus_di) / denominator
+        dx = (
+            0.0
+            if denominator == 0.0
+            else 100.0 * abs(plus_di - minus_di) / denominator
+        )
         dx_values.append((candle_index, dx))
 
         if len(dx_values) == period:
@@ -249,7 +311,9 @@ def adx(
         elif len(dx_values) > period:
             previous_adx = adx_values[candle_index - 1]
             assert previous_adx is not None
-            adx_values[candle_index] = ((previous_adx * (period - 1)) + dx) / period
+            adx_values[candle_index] = (
+                (previous_adx * (period - 1)) + dx
+            ) / period
 
     return adx_values, plus_di_values, minus_di_values
 
@@ -258,7 +322,7 @@ def evaluate_ema_regime_strategy(
     candles: Sequence[Candle],
     settings: StrategySettings | None = None,
 ) -> StrategyDecision:
-    """Evaluate an EMA crossover strategy with RSI and crash-regime guards.
+    """Evaluate the long-only EMA/RSI/ADX regime strategy.
 
     The caller is responsible for supplying chronologically ordered,
     deduplicated, closed candles only.
@@ -275,7 +339,10 @@ def evaluate_ema_regime_strategy(
     if len(candles) < required_candles:
         return StrategyDecision(
             action=DecisionAction.BLOCKED,
-            reason=f"INSUFFICIENT_CLOSED_CANDLES: need at least {required_candles}, got {len(candles)}",
+            reason=(
+                "INSUFFICIENT_CLOSED_CANDLES: "
+                f"need at least {required_candles}, got {len(candles)}"
+            ),
             candle_timestamp=None,
             close=None,
             rsi=None,
@@ -334,26 +401,45 @@ def evaluate_ema_regime_strategy(
         and fast_values[current_index] < slow_values[current_index]
     )
 
-    is_bear_market = closes[current_index] < long_values[current_index]
-    is_crashing = (
-        current_adx >= settings.crash_adx_threshold
-        and current_minus_di > current_plus_di
-    )
-    rsi_ceiling = (
-        settings.rsi_buy_ceiling_bear
-        if is_bear_market
-        else settings.rsi_buy_ceiling_bull
-    )
+    close = closes[current_index]
+    above_long_trend = close > long_values[current_index]
+    below_long_trend = close < long_values[current_index]
 
+    trend_is_bearish = current_minus_di > current_plus_di
+    crash_regime = (
+        current_adx >= settings.crash_adx_threshold
+        and trend_is_bearish
+    )
+    entry_momentum_ok = (
+        settings.rsi_entry_floor <= current_rsi < settings.rsi_entry_ceiling
+    )
+    entry_trend_ok = (
+        current_adx >= settings.adx_entry_threshold
+        and current_plus_di > current_minus_di
+    )
     overbought_reversal = (
-        previous_rsi > settings.rsi_sell_threshold
-        and current_rsi <= settings.rsi_sell_threshold
+        previous_rsi > settings.rsi_exit_threshold
+        and current_rsi <= settings.rsi_exit_threshold
     )
 
     if fast_crossed_down:
         return _decision(
             DecisionAction.EXIT,
             "EXIT_EMA_CROSS_DOWN",
+            candles[current_index],
+            current_rsi,
+            fast_values[current_index],
+            slow_values[current_index],
+            long_values[current_index],
+            current_adx,
+            current_plus_di,
+            current_minus_di,
+        )
+
+    if below_long_trend:
+        return _decision(
+            DecisionAction.EXIT,
+            "EXIT_LONG_TREND_LOST",
             candles[current_index],
             current_rsi,
             fast_values[current_index],
@@ -378,10 +464,10 @@ def evaluate_ema_regime_strategy(
             current_minus_di,
         )
 
-    if is_crashing:
+    if crash_regime:
         return _decision(
-            DecisionAction.HOLD,
-            "BLOCKED_CRASH_REGIME",
+            DecisionAction.BLOCKED,
+            "BLOCKED_BEARISH_HIGH_ADX_REGIME",
             candles[current_index],
             current_rsi,
             fast_values[current_index],
@@ -392,10 +478,15 @@ def evaluate_ema_regime_strategy(
             current_minus_di,
         )
 
-    if fast_crossed_up and current_rsi < rsi_ceiling:
+    if (
+        fast_crossed_up
+        and above_long_trend
+        and entry_momentum_ok
+        and entry_trend_ok
+    ):
         return _decision(
             DecisionAction.ENTER,
-            "ENTER_EMA_CROSS_UP_WITH_RSI_FILTER",
+            "ENTER_BULLISH_EMA_CROSS_WITH_TREND_MOMENTUM_CONFIRMATION",
             candles[current_index],
             current_rsi,
             fast_values[current_index],
@@ -432,6 +523,8 @@ def _decision(
     current_plus_di: float,
     current_minus_di: float,
 ) -> StrategyDecision:
+    """Build a decision that records the final closed-candle indicator values."""
+
     return StrategyDecision(
         action=action,
         reason=reason,
