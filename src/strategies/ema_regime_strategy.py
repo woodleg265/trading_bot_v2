@@ -16,6 +16,7 @@ from typing import Sequence
 class DecisionAction(str, Enum):
     ENTER = "ENTER"
     EXIT = "EXIT"
+    VAULT = "VAULT"
     HOLD = "HOLD"
     BLOCKED = "BLOCKED"
 
