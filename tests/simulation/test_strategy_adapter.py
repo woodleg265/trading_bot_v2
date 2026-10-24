@@ -6,6 +6,7 @@ import pytest
 from src.simulation.audit_writer import SimulationAuditWriter
 from src.simulation.fill_model import SimulationFillConfig, SimulationFillModel
 from src.simulation.ledger import SimulationLedger, SimulationLedgerState
+from src.simulation.models import VaultedLot
 from src.simulation.risk_engine import (
     SimulationRiskContext,
     SimulationRiskEngine,
@@ -175,3 +176,115 @@ def test_naive_candle_timestamp_is_rejected_before_runner(
     assert result.run_results == ()
     assert adapter.state.cash_balance == Decimal("1000")
     assert adapter.risk_context.processed_intent_ids == frozenset()
+def test_vault_removes_inventory_without_runner_side_effects(
+    adapter: SimulationStrategyAdapter,
+    tmp_path,
+) -> None:
+    enter_result = adapter.apply(decision(DecisionAction.ENTER))
+
+    assert enter_result.outcome is SimulationAdapterOutcome.EXECUTED
+    assert adapter.active_entry_price == Decimal("100")
+    assert adapter.active_entry_timestamp == NOW
+    assert adapter.risk_context.current_total_exposure == Decimal("200")
+
+    audit_path = tmp_path / "data" / "simulation" / "strategy-session-001.jsonl"
+    audit_before_vault = audit_path.read_text(encoding="utf-8")
+    processed_intent_ids_before_vault = adapter.risk_context.processed_intent_ids
+    cash_before_vault = adapter.state.cash_balance
+
+    vault_timestamp = "2026-10-16T14:00:30+00:00"
+    vault_result = adapter.apply(
+        decision(
+            DecisionAction.VAULT,
+            timestamp=vault_timestamp,
+            close=999.0,
+        )
+    )
+
+    assert vault_result.outcome is SimulationAdapterOutcome.EXECUTED
+    assert vault_result.run_results == ()
+
+    assert adapter.state.cash_balance == cash_before_vault
+    assert adapter.risk_context.available_cash == cash_before_vault
+    assert adapter.risk_context.processed_intent_ids == processed_intent_ids_before_vault
+    assert audit_path.read_text(encoding="utf-8") == audit_before_vault
+
+    assert dict(adapter.state.position_quantities) == {}
+    assert dict(adapter.risk_context.position_quantities) == {}
+    assert adapter.risk_context.current_total_exposure == Decimal("0")
+
+    assert adapter.vaulted_lots == (
+        VaultedLot(
+            symbol="BTC/USD",
+            quantity=Decimal("2"),
+            acquisition_price=Decimal("100"),
+            acquired_at=NOW,
+            vaulted_at=datetime(
+                2026,
+                10,
+                16,
+                14,
+                0,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        ),
+    )
+
+    assert adapter.active_entry_price is None
+    assert adapter.active_entry_timestamp is None
+
+    event = adapter.events[-1]
+    assert event.action is DecisionAction.VAULT
+    assert event.outcome is SimulationAdapterOutcome.EXECUTED
+    assert event.intent_ids == ()
+
+
+def test_vault_without_open_position_is_a_no_action(
+    adapter: SimulationStrategyAdapter,
+) -> None:
+    before_state = adapter.state
+    before_context = adapter.risk_context
+
+    result = adapter.apply(decision(DecisionAction.VAULT))
+
+    assert result.outcome is SimulationAdapterOutcome.NO_ACTION
+    assert result.run_results == ()
+    assert adapter.state == before_state
+    assert adapter.risk_context == before_context
+    assert adapter.vaulted_lots == ()
+    assert adapter.active_entry_price is None
+    assert adapter.active_entry_timestamp is None
+    assert adapter.events[-1].intent_ids == ()
+
+
+def test_vault_rejects_open_position_without_acquisition_metadata(
+    adapter: SimulationStrategyAdapter,
+) -> None:
+    enter_result = adapter.apply(decision(DecisionAction.ENTER))
+
+    assert enter_result.outcome is SimulationAdapterOutcome.EXECUTED
+    assert adapter.state.position_quantities == {"BTC": Decimal("2")}
+
+    adapter._active_entry_price = None
+    adapter._active_entry_timestamp = None
+
+    before_state = adapter.state
+    before_context = adapter.risk_context
+
+    result = adapter.apply(
+        decision(
+            DecisionAction.VAULT,
+            timestamp="2026-10-16T14:00:30+00:00",
+        )
+    )
+
+    assert result.outcome is SimulationAdapterOutcome.REJECTED
+    assert result.run_results == ()
+    assert "requires active entry metadata" in result.message
+    assert adapter.state == before_state
+    assert adapter.risk_context == before_context
+    assert adapter.vaulted_lots == ()
+    assert adapter.active_entry_price is None
+    assert adapter.active_entry_timestamp is None
+    assert adapter.events[-1].intent_ids == ()
