@@ -9,7 +9,7 @@ from enum import Enum
 from hashlib import sha256
 
 from src.simulation.ledger import SimulationLedgerState
-from src.simulation.models import OrderIntent, Side
+from src.simulation.models import OrderIntent, Side, VaultedLot
 from src.simulation.risk_engine import SimulationRiskContext
 from src.simulation.runner import SimulationRunResult, SimulationRunner
 from src.strategies.ema_regime_strategy import DecisionAction, StrategyDecision
@@ -72,6 +72,21 @@ class SimulationStrategyAdapterEvent:
     intent_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _AdapterTransactionSnapshot:
+    """All adapter-owned state that must roll back on execution failure."""
+
+    state: SimulationLedgerState
+    risk_context: SimulationRiskContext
+    processed_decision_keys: frozenset[str]
+    events: tuple[SimulationStrategyAdapterEvent, ...]
+    event_sequence: int
+    runner_sequence: int
+    vaulted_lots: tuple[VaultedLot, ...]
+    active_entry_price: Decimal | None
+    active_entry_timestamp: datetime | None
+
+
 @dataclass
 class SimulationStrategyAdapter:
     """Routes strategy decisions exclusively through ``SimulationRunner``.
@@ -92,6 +107,9 @@ class SimulationStrategyAdapter:
     )
     _event_sequence: int = field(default=0, init=False)
     _runner_sequence: int = field(default=1, init=False)
+    _vaulted_lots: list[VaultedLot] = field(default_factory=list, init=False)
+    _active_entry_price: Decimal | None = field(default=None, init=False)
+    _active_entry_timestamp: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         normalized_run_id = self.run_id.strip()
@@ -114,6 +132,24 @@ class SimulationStrategyAdapter:
         """Return decision keys already handled by this adapter session."""
 
         return frozenset(self._processed_decision_keys)
+
+    @property
+    def vaulted_lots(self) -> tuple[VaultedLot, ...]:
+        """Return inventory removed from active virtual management."""
+
+        return tuple(self._vaulted_lots)
+
+    @property
+    def active_entry_price(self) -> Decimal | None:
+        """Return the actual fill price for the active virtual position."""
+
+        return self._active_entry_price
+
+    @property
+    def active_entry_timestamp(self) -> datetime | None:
+        """Return the timestamp of the fill that opened the active position."""
+
+        return self._active_entry_timestamp
 
     def apply(self, decision: StrategyDecision) -> SimulationStrategyAdapterResult:
         """Apply a strategy decision through the virtual simulation pipeline."""
@@ -148,6 +184,8 @@ class SimulationStrategyAdapter:
                 message=f"{decision.action.value} decisions do not create virtual orders.",
             )
 
+        snapshot = self._capture_transaction_snapshot()
+
         try:
             price = self._decision_price(decision)
             evaluated_at = self._decision_timestamp(decision)
@@ -167,13 +205,25 @@ class SimulationStrategyAdapter:
                     price=price,
                     evaluated_at=evaluated_at,
                 )
+
+            if decision.action is DecisionAction.VAULT:
+                return self._apply_vault(
+                    decision=decision,
+                    decision_key=decision_key,
+                    vaulted_at=evaluated_at,
+                )
+
         except (InvalidOperation, TypeError, ValueError) as error:
+            self._restore_transaction_snapshot(snapshot)
             return self._complete(
                 decision=decision,
                 outcome=SimulationAdapterOutcome.REJECTED,
                 decision_key=decision_key,
                 message=f"Simulation adapter rejected decision: {error}",
             )
+        except Exception:
+            self._restore_transaction_snapshot(snapshot)
+            raise
 
         return self._complete(
             decision=decision,
@@ -208,6 +258,12 @@ class SimulationStrategyAdapter:
             ordinal=1,
         )
         self._processed_decision_keys.add(decision_key)
+
+        if result.risk_decision.approved:
+            if result.fill is None:
+                raise RuntimeError("Approved virtual ENTER result is missing its fill.")
+            self._active_entry_price = result.fill.fill_price
+            self._active_entry_timestamp = result.fill.filled_at
 
         return self._complete_from_runs(
             decision=decision,
@@ -257,10 +313,85 @@ class SimulationStrategyAdapter:
 
         self._processed_decision_keys.add(decision_key)
 
+        if quantity_remaining <= ZERO:
+            self._active_entry_price = None
+            self._active_entry_timestamp = None
+
         return self._complete_from_runs(
             decision=decision,
             decision_key=decision_key,
             run_results=tuple(run_results),
+        )
+
+    def _apply_vault(
+        self,
+        *,
+        decision: StrategyDecision,
+        decision_key: str,
+        vaulted_at: datetime,
+    ) -> SimulationStrategyAdapterResult:
+        """Remove open virtual inventory without generating an order or fill."""
+
+        quantity = self._position_quantity()
+
+        if quantity <= ZERO:
+            self._processed_decision_keys.add(decision_key)
+            return self._complete(
+                decision=decision,
+                outcome=SimulationAdapterOutcome.NO_ACTION,
+                decision_key=decision_key,
+                message="VAULT ignored because no virtual position is open.",
+            )
+
+        if (
+            self._active_entry_price is None
+            or self._active_entry_timestamp is None
+        ):
+            self._processed_decision_keys.add(decision_key)
+            return self._complete(
+                decision=decision,
+                outcome=SimulationAdapterOutcome.REJECTED,
+                decision_key=decision_key,
+                message="VAULT requires active entry metadata.",
+            )
+
+        base_asset = self.config.symbol.split("/", maxsplit=1)[0]
+
+        positions = dict(self.state.position_quantities)
+        positions.pop(base_asset, None)
+        self.state = SimulationLedgerState(
+            cash_balance=self.state.cash_balance,
+            cash_currency=self.state.cash_currency,
+            position_quantities=positions,
+        )
+
+        risk_positions = dict(self.risk_context.position_quantities)
+        risk_positions.pop(self.config.symbol, None)
+        self.risk_context = SimulationRiskContext(
+            available_cash=self.state.cash_balance,
+            position_quantities=risk_positions,
+            current_total_exposure=ZERO,
+            processed_intent_ids=self.risk_context.processed_intent_ids,
+        )
+
+        self._vaulted_lots.append(
+            VaultedLot(
+                symbol=self.config.symbol,
+                quantity=quantity,
+                acquisition_price=self._active_entry_price,
+                acquired_at=self._active_entry_timestamp,
+                vaulted_at=vaulted_at,
+            )
+        )
+        self._active_entry_price = None
+        self._active_entry_timestamp = None
+        self._processed_decision_keys.add(decision_key)
+
+        return self._complete(
+            decision=decision,
+            outcome=SimulationAdapterOutcome.EXECUTED,
+            decision_key=decision_key,
+            message="VAULT removed virtual inventory from active management.",
         )
 
     def _process_intent(
@@ -364,6 +495,37 @@ class SimulationStrategyAdapter:
             )
         )
         return result
+
+    def _capture_transaction_snapshot(self) -> _AdapterTransactionSnapshot:
+        """Capture every adapter-held value that an execution may mutate."""
+
+        return _AdapterTransactionSnapshot(
+            state=self.state,
+            risk_context=self.risk_context,
+            processed_decision_keys=frozenset(self._processed_decision_keys),
+            events=tuple(self._events),
+            event_sequence=self._event_sequence,
+            runner_sequence=self._runner_sequence,
+            vaulted_lots=tuple(self._vaulted_lots),
+            active_entry_price=self._active_entry_price,
+            active_entry_timestamp=self._active_entry_timestamp,
+        )
+
+    def _restore_transaction_snapshot(
+        self,
+        snapshot: _AdapterTransactionSnapshot,
+    ) -> None:
+        """Restore adapter-owned durable state after an unexpected failure."""
+
+        self.state = snapshot.state
+        self.risk_context = snapshot.risk_context
+        self._processed_decision_keys = set(snapshot.processed_decision_keys)
+        self._events = list(snapshot.events)
+        self._event_sequence = snapshot.event_sequence
+        self._runner_sequence = snapshot.runner_sequence
+        self._vaulted_lots = list(snapshot.vaulted_lots)
+        self._active_entry_price = snapshot.active_entry_price
+        self._active_entry_timestamp = snapshot.active_entry_timestamp
 
     def _position_quantity(self) -> Decimal:
         base_asset = self.config.symbol.split("/", maxsplit=1)[0]
