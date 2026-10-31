@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+import tempfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -31,6 +32,17 @@ _SENSITIVE_KEY_FRAGMENTS = (
     "private_key",
     "credential",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationAuditEvent:
+    """One validated candidate record for a simulation audit trail."""
+
+    run_id: str
+    sequence: int
+    event_type: str
+    occurred_at: datetime
+    payload: Mapping[str, Any]
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -111,17 +123,141 @@ class SimulationAuditWriter:
         occurred_at: datetime,
         payload: Mapping[str, Any],
     ) -> Path:
-        """Write one deterministic structured audit record for a simulation run."""
-        if not run_id or not run_id.strip():
+        """Write one deterministic structured audit record immediately."""
+        output_path, serialized = self._serialize_event(
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with output_path.open("a", encoding="utf-8") as audit_file:
+            audit_file.write(serialized)
+            audit_file.write("\n")
+            audit_file.flush()
+            os.fsync(audit_file.fileno())
+
+        return output_path
+
+    def append_events_atomically(
+        self,
+        events: Sequence[SimulationAuditEvent],
+    ) -> Path | None:
+        """
+        Append a single run's records with one atomic file replacement.
+
+        All records are validated and serialized before the existing audit
+        file is changed. An exception before replacement leaves the prior
+        file unchanged.
+        """
+        if not events:
+            return None
+
+        serialized_events: list[str] = []
+        output_path: Path | None = None
+
+        for event in events:
+            if not isinstance(event, SimulationAuditEvent):
+                raise TypeError("events must contain SimulationAuditEvent values")
+
+            candidate_path, serialized = self._serialize_event(
+                run_id=event.run_id,
+                sequence=event.sequence,
+                event_type=event.event_type,
+                occurred_at=event.occurred_at,
+                payload=event.payload,
+            )
+
+            if output_path is None:
+                output_path = candidate_path
+            elif candidate_path != output_path:
+                raise SimulationAuditValidationError(
+                    "Atomic audit batches must contain events for one run."
+                )
+
+            serialized_events.append(serialized)
+
+        assert output_path is not None
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        existing_contents = (
+            output_path.read_bytes() if output_path.exists() else b""
+        )
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+
+        try:
+            with os.fdopen(file_descriptor, "wb") as temporary_file:
+                temporary_file.write(existing_contents)
+
+                for serialized in serialized_events:
+                    temporary_file.write(serialized.encode("utf-8"))
+                    temporary_file.write(b"\n")
+
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+
+            os.replace(temporary_path, output_path)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+        return output_path
+
+    def validate_event(
+        self,
+        *,
+        run_id: str,
+        sequence: int,
+        event_type: str,
+        occurred_at: datetime,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Validate an event without writing it to disk."""
+        self._serialize_event(
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+
+    def path_for_run(self, run_id: str) -> Path:
+        """Return the validated audit-file path for a run without writing."""
+        return self._path_for_run(run_id)
+
+    def _serialize_event(
+        self,
+        *,
+        run_id: str,
+        sequence: int,
+        event_type: str,
+        occurred_at: datetime,
+        payload: Mapping[str, Any],
+    ) -> tuple[Path, str]:
+        if not isinstance(run_id, str) or not run_id.strip():
             raise SimulationAuditValidationError("run_id must be non-empty.")
 
-        if sequence < 1:
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
             raise SimulationAuditValidationError("sequence must be at least 1.")
 
-        if not event_type or not event_type.strip():
+        if not isinstance(event_type, str) or not event_type.strip():
             raise SimulationAuditValidationError("event_type must be non-empty.")
 
-        if occurred_at.tzinfo is None:
+        if not isinstance(occurred_at, datetime) or occurred_at.tzinfo is None:
+            raise SimulationAuditValidationError(
+                "occurred_at must be timezone-aware for deterministic audit records."
+            )
+
+        if occurred_at.utcoffset() is None:
             raise SimulationAuditValidationError(
                 "occurred_at must be timezone-aware for deterministic audit records."
             )
@@ -129,15 +265,15 @@ class SimulationAuditWriter:
         if not isinstance(payload, Mapping):
             raise SimulationAuditValidationError("payload must be a mapping.")
 
-        output_path = self._path_for_run(run_id)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        normalized_run_id = run_id.strip()
+        output_path = self._path_for_run(normalized_run_id)
 
         record = {
-            "event_id": f"{run_id}:audit:{sequence:06d}",
+            "event_id": f"{normalized_run_id}:audit:{sequence:06d}",
             "event_type": event_type,
             "occurred_at": occurred_at.isoformat(),
             "payload": _sanitize(payload),
-            "run_id": run_id,
+            "run_id": normalized_run_id,
             "sequence": sequence,
         }
 
@@ -149,13 +285,7 @@ class SimulationAuditWriter:
             allow_nan=False,
         )
 
-        with output_path.open("a", encoding="utf-8") as audit_file:
-            audit_file.write(serialized)
-            audit_file.write("\n")
-            audit_file.flush()
-            os.fsync(audit_file.fileno())
-
-        return output_path
+        return output_path, serialized
 
     def _path_for_run(self, run_id: str) -> Path:
         filename = f"{run_id}.jsonl"

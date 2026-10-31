@@ -83,3 +83,28 @@ class SimulationPosition:
     quantity: Decimal
     average_entry_price: Decimal
     realized_pnl: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class VaultedLot:
+    """Inventory removed from active virtual management without a sale."""
+
+    symbol: str
+    quantity: Decimal
+    acquisition_price: Decimal
+    acquired_at: datetime
+    vaulted_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        if self.quantity <= Decimal("0"):
+            raise ValueError("quantity must be greater than zero")
+        if self.acquisition_price <= Decimal("0"):
+            raise ValueError("acquisition_price must be greater than zero")
+        if self.acquired_at.tzinfo is None or self.acquired_at.utcoffset() is None:
+            raise ValueError("acquired_at must be timezone-aware")
+        if self.vaulted_at.tzinfo is None or self.vaulted_at.utcoffset() is None:
+            raise ValueError("vaulted_at must be timezone-aware")
+        if self.vaulted_at < self.acquired_at:
+            raise ValueError("vaulted_at cannot be earlier than acquired_at")

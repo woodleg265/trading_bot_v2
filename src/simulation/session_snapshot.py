@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any, Mapping
 
 from src.simulation.fill_model import SimulationFillConfig
 from src.simulation.ledger import SimulationLedgerState
+from src.simulation.models import VaultedLot
 from src.simulation.risk_engine import SimulationRiskContext, SimulationRiskLimits
 from src.simulation.session import SimulationSession, SimulationSessionConfig
 from src.simulation.strategy_adapter import SimulationStrategyAdapterConfig
+from src.strategies.brawler_strategy import BrawlerCampaignState
 
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+ZERO = Decimal("0")
 
 
 def _mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -30,12 +34,35 @@ def _string(value: object, name: str) -> str:
     return value
 
 
+def _optional_string(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, name)
+
+
 def _integer(value: object, name: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return value
+
+
+def _float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{name} must be finite")
+
+    return result
+
+
+def _optional_float(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    return _float(value, name)
 
 
 def _decimal(value: object, name: str) -> Decimal:
@@ -51,6 +78,12 @@ def _decimal(value: object, name: str) -> Decimal:
         raise ValueError(f"{name} must be finite")
 
     return result
+
+
+def _optional_decimal(value: object, name: str) -> Decimal | None:
+    if value is None:
+        return None
+    return _decimal(value, name)
 
 
 def _decimal_map(value: object, name: str) -> dict[str, Decimal]:
@@ -72,6 +105,33 @@ def _decimal_map_json(values: Mapping[str, Decimal]) -> dict[str, str]:
     }
 
 
+def _timestamp(value: object, name: str) -> datetime:
+    raw_timestamp = _string(value, name)
+
+    try:
+        parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{name} must be a valid ISO-8601 timestamp") from error
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} must include timezone information")
+
+    return parsed.astimezone(timezone.utc)
+
+
+def _optional_timestamp(value: object, name: str) -> datetime | None:
+    if value is None:
+        return None
+    return _timestamp(value, name)
+
+
+def _timestamp_json(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must include timezone information")
+
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _exact_keys(
     payload: Mapping[str, Any],
     expected: set[str],
@@ -86,6 +146,104 @@ def _exact_keys(
         raise ValueError(f"{name} has unexpected fields: {sorted(unexpected)}")
 
 
+def _vaulted_lot_to_dict(lot: VaultedLot) -> dict[str, str]:
+    return {
+        "symbol": lot.symbol,
+        "quantity": str(lot.quantity),
+        "acquisition_price": str(lot.acquisition_price),
+        "acquired_at": _timestamp_json(lot.acquired_at),
+        "vaulted_at": _timestamp_json(lot.vaulted_at),
+    }
+
+
+def _vaulted_lot_from_dict(value: object, name: str) -> VaultedLot:
+    payload = _mapping(value, name)
+    _exact_keys(
+        payload,
+        {
+            "symbol",
+            "quantity",
+            "acquisition_price",
+            "acquired_at",
+            "vaulted_at",
+        },
+        name,
+    )
+
+    return VaultedLot(
+        symbol=_string(payload["symbol"], f"{name}.symbol"),
+        quantity=_decimal(payload["quantity"], f"{name}.quantity"),
+        acquisition_price=_decimal(
+            payload["acquisition_price"],
+            f"{name}.acquisition_price",
+        ),
+        acquired_at=_timestamp(payload["acquired_at"], f"{name}.acquired_at"),
+        vaulted_at=_timestamp(payload["vaulted_at"], f"{name}.vaulted_at"),
+    )
+
+
+def _vaulted_lots_from_json(value: object) -> tuple[VaultedLot, ...]:
+    if not isinstance(value, list):
+        raise ValueError("vaulted_lots must be a list")
+
+    return tuple(
+        _vaulted_lot_from_dict(raw_lot, f"vaulted_lots[{index}]")
+        for index, raw_lot in enumerate(value)
+    )
+
+
+def _brawler_campaign_to_dict(
+    campaign: BrawlerCampaignState,
+) -> dict[str, float | str | None]:
+    return {
+        "entry_price": campaign.entry_price,
+        "entry_timestamp": campaign.entry_timestamp,
+        "rsi_peak": campaign.rsi_peak,
+        "cooldown_until": campaign.cooldown_until,
+    }
+
+
+def _brawler_campaign_from_dict(value: object) -> BrawlerCampaignState:
+    payload = _mapping(value, "brawler_campaign")
+    _exact_keys(
+        payload,
+        {
+            "entry_price",
+            "entry_timestamp",
+            "rsi_peak",
+            "cooldown_until",
+        },
+        "brawler_campaign",
+    )
+
+    entry_price = _optional_float(
+        payload["entry_price"],
+        "brawler_campaign.entry_price",
+    )
+    entry_timestamp = _optional_string(
+        payload["entry_timestamp"],
+        "brawler_campaign.entry_timestamp",
+    )
+    rsi_peak = _optional_float(
+        payload["rsi_peak"],
+        "brawler_campaign.rsi_peak",
+    )
+    cooldown_until = _optional_string(
+        payload["cooldown_until"],
+        "brawler_campaign.cooldown_until",
+    )
+
+    try:
+        return BrawlerCampaignState(
+            entry_price=entry_price,
+            entry_timestamp=entry_timestamp,
+            rsi_peak=rsi_peak,
+            cooldown_until=cooldown_until,
+        )
+    except ValueError as error:
+        raise ValueError(f"brawler_campaign is invalid: {error}") from error
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationSessionSnapshot:
     """All deterministic state needed to resume one simulation session."""
@@ -97,6 +255,10 @@ class SimulationSessionSnapshot:
     processed_decision_keys: frozenset[str]
     event_sequence: int
     runner_sequence: int
+    vaulted_lots: tuple[VaultedLot, ...]
+    active_entry_price: Decimal | None
+    active_entry_timestamp: datetime | None
+    brawler_campaign: BrawlerCampaignState
 
     def __post_init__(self) -> None:
         if self.version != SNAPSHOT_VERSION:
@@ -126,6 +288,58 @@ class SimulationSessionSnapshot:
                     "processed_decision_keys must contain non-empty strings"
                 )
 
+        if not all(isinstance(lot, VaultedLot) for lot in self.vaulted_lots):
+            raise TypeError("vaulted_lots must contain VaultedLot values")
+
+        if (self.active_entry_price is None) != (
+            self.active_entry_timestamp is None
+        ):
+            raise ValueError(
+                "active_entry_price and active_entry_timestamp must either "
+                "both be present or both be absent"
+            )
+
+        if self.active_entry_price is not None:
+            if (
+                not self.active_entry_price.is_finite()
+                or self.active_entry_price <= ZERO
+            ):
+                raise ValueError(
+                    "active_entry_price must be finite and greater than zero"
+                )
+
+        if self.active_entry_timestamp is not None:
+            if (
+                self.active_entry_timestamp.tzinfo is None
+                or self.active_entry_timestamp.utcoffset() is None
+            ):
+                raise ValueError(
+                    "active_entry_timestamp must be timezone-aware"
+                )
+
+        if not isinstance(self.brawler_campaign, BrawlerCampaignState):
+            raise TypeError("brawler_campaign must be a BrawlerCampaignState")
+
+        base_asset = self.config.strategy_adapter.symbol.split("/", maxsplit=1)[0]
+        position_quantity = self.ledger_state.position_quantities.get(
+            base_asset,
+            ZERO,
+        )
+        has_open_position = position_quantity > ZERO
+        has_active_entry = self.active_entry_price is not None
+
+        if has_open_position and not has_active_entry:
+            raise ValueError(
+                "v2 snapshots require active entry metadata for an open "
+                "configured-symbol position"
+            )
+
+        if not has_open_position and has_active_entry:
+            raise ValueError(
+                "active entry metadata cannot be present when the configured "
+                "symbol has no open virtual position"
+            )
+
     @classmethod
     def from_session(
         cls,
@@ -146,6 +360,10 @@ class SimulationSessionSnapshot:
             processed_decision_keys=session.processed_decision_keys,
             event_sequence=adapter._event_sequence,
             runner_sequence=adapter._runner_sequence,
+            vaulted_lots=session.vaulted_lots,
+            active_entry_price=session.active_entry_price,
+            active_entry_timestamp=session.active_entry_timestamp,
+            brawler_campaign=session.brawler_campaign,
         )
 
     @classmethod
@@ -164,6 +382,10 @@ class SimulationSessionSnapshot:
             self.config,
             initial_ledger_state=self.ledger_state,
             initial_risk_context=self.risk_context,
+            initial_vaulted_lots=self.vaulted_lots,
+            initial_active_entry_price=self.active_entry_price,
+            initial_active_entry_timestamp=self.active_entry_timestamp,
+            initial_brawler_campaign=self.brawler_campaign,
         )
 
         adapter = session._adapter
@@ -236,6 +458,23 @@ class SimulationSessionSnapshot:
             "processed_decision_keys": sorted(self.processed_decision_keys),
             "event_sequence": self.event_sequence,
             "runner_sequence": self.runner_sequence,
+            "vaulted_lots": [
+                _vaulted_lot_to_dict(lot)
+                for lot in self.vaulted_lots
+            ],
+            "active_entry_price": (
+                str(self.active_entry_price)
+                if self.active_entry_price is not None
+                else None
+            ),
+            "active_entry_timestamp": (
+                _timestamp_json(self.active_entry_timestamp)
+                if self.active_entry_timestamp is not None
+                else None
+            ),
+            "brawler_campaign": _brawler_campaign_to_dict(
+                self.brawler_campaign
+            ),
         }
 
     def to_json(self) -> str:
@@ -245,11 +484,12 @@ class SimulationSessionSnapshot:
             self.to_dict(),
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
 
     @classmethod
     def from_dict(cls, value: object) -> "SimulationSessionSnapshot":
-        """Validate and deserialize a decoded snapshot object."""
+        """Validate and deserialize a decoded v2 snapshot object."""
 
         payload = _mapping(value, "snapshot")
         _exact_keys(
@@ -262,6 +502,10 @@ class SimulationSessionSnapshot:
                 "processed_decision_keys",
                 "event_sequence",
                 "runner_sequence",
+                "vaulted_lots",
+                "active_entry_price",
+                "active_entry_timestamp",
+                "brawler_campaign",
             },
             "snapshot",
         )
@@ -451,7 +695,8 @@ class SimulationSessionSnapshot:
 
         decision_keys = payload["processed_decision_keys"]
         if not isinstance(decision_keys, list) or not all(
-            isinstance(key, str) and key for key in decision_keys
+            isinstance(key, str) and key
+            for key in decision_keys
         ):
             raise ValueError(
                 "processed_decision_keys must be a list of non-empty strings"
@@ -468,6 +713,18 @@ class SimulationSessionSnapshot:
                 payload["runner_sequence"],
                 "runner_sequence",
                 minimum=1,
+            ),
+            vaulted_lots=_vaulted_lots_from_json(payload["vaulted_lots"]),
+            active_entry_price=_optional_decimal(
+                payload["active_entry_price"],
+                "active_entry_price",
+            ),
+            active_entry_timestamp=_optional_timestamp(
+                payload["active_entry_timestamp"],
+                "active_entry_timestamp",
+            ),
+            brawler_campaign=_brawler_campaign_from_dict(
+                payload["brawler_campaign"]
             ),
         )
 

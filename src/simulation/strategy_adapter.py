@@ -12,6 +12,7 @@ from src.simulation.ledger import SimulationLedgerState
 from src.simulation.models import OrderIntent, Side, VaultedLot
 from src.simulation.risk_engine import SimulationRiskContext
 from src.simulation.runner import SimulationRunResult, SimulationRunner
+from src.simulation.staged_audit_writer import StagedSimulationAuditWriter
 from src.strategies.ema_regime_strategy import DecisionAction, StrategyDecision
 
 
@@ -96,6 +97,7 @@ class SimulationStrategyAdapter:
     """
 
     runner: SimulationRunner
+    audit_writer: StagedSimulationAuditWriter
     config: SimulationStrategyAdapterConfig
     state: SimulationLedgerState
     risk_context: SimulationRiskContext
@@ -185,35 +187,59 @@ class SimulationStrategyAdapter:
             )
 
         snapshot = self._capture_transaction_snapshot()
+        audit_transaction_required = decision.action in (
+            DecisionAction.ENTER,
+            DecisionAction.EXIT,
+        )
+
+        if audit_transaction_required:
+            self.audit_writer.begin()
 
         try:
             price = self._decision_price(decision)
             evaluated_at = self._decision_timestamp(decision)
 
             if decision.action is DecisionAction.ENTER:
-                return self._apply_enter(
+                result = self._apply_enter(
                     decision=decision,
                     decision_key=decision_key,
                     price=price,
                     evaluated_at=evaluated_at,
                 )
-
-            if decision.action is DecisionAction.EXIT:
-                return self._apply_exit(
+            elif decision.action is DecisionAction.EXIT:
+                result = self._apply_exit(
                     decision=decision,
                     decision_key=decision_key,
                     price=price,
                     evaluated_at=evaluated_at,
                 )
-
-            if decision.action is DecisionAction.VAULT:
-                return self._apply_vault(
+            elif decision.action is DecisionAction.VAULT:
+                result = self._apply_vault(
                     decision=decision,
                     decision_key=decision_key,
                     vaulted_at=evaluated_at,
                 )
+            else:
+                result = self._complete(
+                    decision=decision,
+                    outcome=SimulationAdapterOutcome.REJECTED,
+                    decision_key=decision_key,
+                    message=f"Unsupported strategy action: {decision.action!r}",
+                )
+
+            if audit_transaction_required:
+                # A risk rejection is a valid completed simulation attempt:
+                # it records a processed intent and a RISK_DECISION audit event.
+                # Rollback is reserved for exceptions, where a transition was
+                # interrupted before it could complete normally.
+                self.audit_writer.commit()
+
+            return result
 
         except (InvalidOperation, TypeError, ValueError) as error:
+            if audit_transaction_required:
+                self.audit_writer.rollback()
+
             self._restore_transaction_snapshot(snapshot)
             return self._complete(
                 decision=decision,
@@ -222,15 +248,11 @@ class SimulationStrategyAdapter:
                 message=f"Simulation adapter rejected decision: {error}",
             )
         except Exception:
+            if audit_transaction_required:
+                self.audit_writer.rollback()
+
             self._restore_transaction_snapshot(snapshot)
             raise
-
-        return self._complete(
-            decision=decision,
-            outcome=SimulationAdapterOutcome.REJECTED,
-            decision_key=decision_key,
-            message=f"Unsupported strategy action: {decision.action!r}",
-        )
 
     def _apply_enter(
         self,

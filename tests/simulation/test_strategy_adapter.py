@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from src.simulation.audit_writer import SimulationAuditWriter
+from src.simulation.staged_audit_writer import StagedSimulationAuditWriter
 from src.simulation.fill_model import SimulationFillConfig, SimulationFillModel
 from src.simulation.ledger import SimulationLedger, SimulationLedgerState
 from src.simulation.models import VaultedLot
@@ -49,6 +50,8 @@ def decision(
 def adapter(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.chdir(tmp_path)
 
+    audit_writer = StagedSimulationAuditWriter(SimulationAuditWriter())
+
     runner = SimulationRunner(
         risk_engine=SimulationRiskEngine(
             SimulationRiskLimits(
@@ -67,11 +70,12 @@ def adapter(tmp_path, monkeypatch: pytest.MonkeyPatch):
             )
         ),
         ledger=SimulationLedger(),
-        audit_writer=SimulationAuditWriter(),
+        audit_writer=audit_writer,
     )
 
     return SimulationStrategyAdapter(
         runner=runner,
+        audit_writer=audit_writer,
         config=SimulationStrategyAdapterConfig(
             symbol="BTC/USD",
             entry_quantity=Decimal("2"),
