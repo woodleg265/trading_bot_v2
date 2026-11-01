@@ -320,12 +320,28 @@ class SimulationSessionSnapshot:
         if not isinstance(self.brawler_campaign, BrawlerCampaignState):
             raise TypeError("brawler_campaign must be a BrawlerCampaignState")
 
-        base_asset = self.config.strategy_adapter.symbol.split("/", maxsplit=1)[0]
-        position_quantity = self.ledger_state.position_quantities.get(
+        configured_symbol = self.config.strategy_adapter.symbol
+        base_asset = configured_symbol.split("/", maxsplit=1)[0].strip().upper()
+
+        ledger_position_quantity = self.ledger_state.position_quantities.get(
             base_asset,
             ZERO,
         )
-        has_open_position = position_quantity > ZERO
+        risk_position_quantity = self.risk_context.position_quantities.get(
+            configured_symbol,
+            ZERO,
+        )
+
+        if ledger_position_quantity != risk_position_quantity:
+            raise ValueError(
+                "ledger_state.position_quantities and "
+                "risk_context.position_quantities are inconsistent for "
+                f"{configured_symbol}: "
+                f"ledger={ledger_position_quantity}, "
+                f"risk={risk_position_quantity}"
+            )
+
+        has_open_position = ledger_position_quantity > ZERO
         has_active_entry = self.active_entry_price is not None
 
         if has_open_position and not has_active_entry:
