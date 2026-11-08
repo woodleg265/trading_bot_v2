@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import MutableSequence, Sequence
 from datetime import datetime, timezone
 
+from src.simulation.backtest_events import (
+    BacktestEvent,
+    build_backtest_event,
+    capture_backtest_event_state,
+)
 from src.simulation.session import SimulationSession
 from src.simulation.strategy_adapter import SimulationStrategyAdapterResult
 from src.strategies.brawler_strategy import (
@@ -21,6 +26,7 @@ def run_brawler_historical_replay(
     candles_1h: Sequence[Candle],
     settings: BrawlerSettings | None = None,
     start_index: int = 0,
+    event_sink: MutableSequence[BacktestEvent] | None = None,
 ) -> tuple[SimulationStrategyAdapterResult, ...]:
     """Replay ordered, finalized 5-minute candles through Brawler.
 
@@ -38,6 +44,10 @@ def run_brawler_historical_replay(
 
     The session owns campaign-state persistence. Therefore, a rejected ENTER
     or VAULT does not incorrectly advance Brawler's campaign during replay.
+
+    When ``event_sink`` is provided, one immutable audit event is appended
+    for every evaluation submitted to the simulation session. Warm-up
+    evaluations with no executable timestamp do not produce events.
     """
 
     _validate_chronological_candles(candles_5m, label="candles_5m")
@@ -75,7 +85,22 @@ def run_brawler_historical_replay(
         if evaluation.decision.candle_timestamp is None:
             continue
 
-        results.append(session.process_brawler_evaluation(evaluation))
+        state_before = capture_backtest_event_state(session)
+        result = session.process_brawler_evaluation(evaluation)
+        state_after = capture_backtest_event_state(session)
+
+        results.append(result)
+
+        if event_sink is not None:
+            event_sink.append(
+                build_backtest_event(
+                    sequence=len(event_sink) + 1,
+                    evaluation=evaluation,
+                    result=result,
+                    state_before=state_before,
+                    state_after=state_after,
+                )
+            )
 
     return tuple(results)
 
