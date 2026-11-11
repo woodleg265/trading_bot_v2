@@ -7,23 +7,29 @@ from pathlib import Path
 
 from src.data.historical_candles import load_candles_csv
 from src.simulation.backtest_events import BacktestEvent
+from src.simulation.backtest_performance import (
+    BacktestPerformanceReport,
+    build_backtest_performance_report,
+)
+from src.simulation.execution_model import (
+    ExecutionModel,
+    FillPriceBasis,
+    FillTiming,
+)
 from src.simulation.historical_replay import run_brawler_historical_replay
 from src.simulation.replay_report import ReplayReport, build_replay_report
 from src.simulation.session import SimulationSession
 from src.simulation.session_snapshot import SimulationSessionSnapshot
 from src.strategies.brawler_strategy import BrawlerSettings
-from src.simulation.backtest_performance import (
-    BacktestPerformanceReport,
-    build_backtest_performance_report,
-)
 
 
 @dataclass(frozen=True, slots=True)
 class BrawlerBacktestResult:
-    """Durable final state, report, and audit ledger from a Brawler backtest."""
+    """Durable final state, reports, ledger, and execution assumptions."""
 
     report: ReplayReport
     performance: BacktestPerformanceReport
+    execution_model: ExecutionModel
     final_snapshot: SimulationSessionSnapshot
     events: tuple[BacktestEvent, ...]
 
@@ -60,10 +66,20 @@ def run_brawler_backtest(
     )
 
     immutable_events = tuple(events)
+    fill_config = session.config.fill_config
+
+    execution_model = ExecutionModel(
+        model_id="simulation-candle-close-v1",
+        fill_timing=FillTiming.EVALUATION_CANDLE_CLOSE,
+        fill_price_basis=FillPriceBasis.CANDLE_CLOSE,
+        slippage_rate=fill_config.slippage_rate,
+        fee_rate=fill_config.fee_rate,
+    )
 
     return BrawlerBacktestResult(
         report=build_replay_report(session),
         performance=build_backtest_performance_report(immutable_events),
+        execution_model=execution_model,
         final_snapshot=SimulationSessionSnapshot.capture(session),
         events=immutable_events,
     )
