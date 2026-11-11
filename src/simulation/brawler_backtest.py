@@ -12,6 +12,10 @@ from src.simulation.replay_report import ReplayReport, build_replay_report
 from src.simulation.session import SimulationSession
 from src.simulation.session_snapshot import SimulationSessionSnapshot
 from src.strategies.brawler_strategy import BrawlerSettings
+from src.simulation.backtest_performance import (
+    BacktestPerformanceReport,
+    build_backtest_performance_report,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +23,7 @@ class BrawlerBacktestResult:
     """Durable final state, report, and audit ledger from a Brawler backtest."""
 
     report: ReplayReport
+    performance: BacktestPerformanceReport
     final_snapshot: SimulationSessionSnapshot
     events: tuple[BacktestEvent, ...]
 
@@ -54,8 +59,11 @@ def run_brawler_backtest(
         event_sink=events,
     )
 
+    immutable_events = tuple(events)
+
     return BrawlerBacktestResult(
         report=build_replay_report(session),
+        performance=build_backtest_performance_report(immutable_events),
         final_snapshot=SimulationSessionSnapshot.capture(session),
-        events=tuple(events),
+        events=immutable_events,
     )

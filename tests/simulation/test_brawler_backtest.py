@@ -70,7 +70,7 @@ def _report_values(report: object) -> dict[str, object]:
     return asdict(report)
 
 
-def test_backtest_returns_report_and_final_snapshot(
+def test_backtest_returns_report_final_snapshot_and_performance(
     session_config: SimulationSessionConfig,
 ) -> None:
     session, result = _run_backtest(session_config)
@@ -78,17 +78,13 @@ def test_backtest_returns_report_and_final_snapshot(
     assert isinstance(result, BrawlerBacktestResult)
     assert result.final_snapshot == SimulationSessionSnapshot.capture(session)
 
+    assert isinstance(result.events, tuple)
+    assert result.performance.total_events == len(result.events)
+
     report_values = _report_values(result.report)
 
-    # These assertions establish that the result contains a real durable
-    # projection rather than merely checking that the report equals itself.
-    assert any(
-        value == Decimal("1000")
-        for value in report_values.values()
-    )
-    report_values = _report_values(result.report)
-
-    # Confirm the report is a meaningful projection of the completed session.
+    # Confirm that the report is a real durable projection of the completed
+    # session rather than an empty placeholder.
     assert any(
         value == Decimal("1000")
         for value in report_values.values()
@@ -104,6 +100,8 @@ def test_backtest_report_projects_initial_cash_when_fixture_has_no_trade(
 ) -> None:
     _, result = _run_backtest(session_config)
     report_values = _report_values(result.report)
+
+    assert result.performance.total_events == len(result.events)
 
     cash_values = {
         field_name: value
@@ -208,6 +206,11 @@ def test_backtest_is_deterministic_across_independent_sessions(
 
     assert first_result.report == second_result.report
     assert first_result.final_snapshot == second_result.final_snapshot
+    assert first_result.events == second_result.events
+    assert first_result.performance == second_result.performance
+
+    assert first_result.performance.total_events == len(first_result.events)
+    assert second_result.performance.total_events == len(second_result.events)
 
     assert first_result.final_snapshot == SimulationSessionSnapshot.capture(
         first_session
