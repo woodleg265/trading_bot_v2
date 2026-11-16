@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from src.simulation.session import SimulationSession
 from src.simulation.strategy_adapter import SimulationStrategyAdapterResult
@@ -19,6 +19,7 @@ class BacktestEvent:
 
     sequence: int
     candle_timestamp: str
+    reference_price: Decimal
     action: str
     reason: str
     outcome: str
@@ -115,6 +116,22 @@ def build_backtest_event(
             "Backtest events require a submitted evaluation with a candle timestamp"
         )
 
+    try:
+        reference_price = Decimal(str(decision.close))
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(
+            "Backtest events require a valid decimal reference price"
+        ) from error
+
+    if not reference_price.is_finite():
+        raise ValueError(
+            "Backtest events require a finite reference price"
+        )
+    if reference_price < ZERO:
+        raise ValueError(
+            "Backtest events require a non-negative reference price"
+        )
+
     risk_approved: bool | None = None
     risk_code: str | None = None
 
@@ -126,6 +143,7 @@ def build_backtest_event(
     return BacktestEvent(
         sequence=sequence,
         candle_timestamp=decision.candle_timestamp,
+        reference_price=reference_price,
         action=decision.action.value,
         reason=decision.reason,
         outcome=result.outcome.value,

@@ -17,6 +17,7 @@ def make_event(
     action: str = "ENTER",
     outcome: str = "EXECUTED",
     risk_code: str | None = None,
+    reference_price: Decimal = Decimal("100"),
 ) -> BacktestEvent:
     """Create a minimal immutable event for report projection tests."""
 
@@ -28,6 +29,7 @@ def make_event(
         outcome=outcome,
         risk_approved=outcome != "REJECTED",
         risk_code=risk_code,
+        reference_price=reference_price,
         cash_before=Decimal("1000"),
         cash_after=Decimal("1000"),
         active_quantity_before=Decimal("0"),

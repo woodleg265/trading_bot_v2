@@ -81,6 +81,28 @@ def test_backtest_returns_report_final_snapshot_and_performance(
     assert isinstance(result.events, tuple)
     assert result.performance.total_events == len(result.events)
 
+    assert isinstance(result.financial_performance.equity_curve, tuple)
+    assert (
+        result.financial_performance.starting_equity
+        == session_config.initial_cash_balance
+    )
+
+    expected_ending_equity = (
+        result.events[-1].cash_after
+        + (
+            result.events[-1].active_quantity_after
+            + result.events[-1].vaulted_quantity_after
+        )
+        * result.events[-1].reference_price
+        if result.events
+        else session_config.initial_cash_balance
+    )
+
+    assert (
+        result.financial_performance.ending_equity
+        == expected_ending_equity
+    )
+
     report_values = _report_values(result.report)
 
     # Confirm that the report is a real durable projection of the completed
@@ -208,6 +230,10 @@ def test_backtest_is_deterministic_across_independent_sessions(
     assert first_result.final_snapshot == second_result.final_snapshot
     assert first_result.events == second_result.events
     assert first_result.performance == second_result.performance
+    assert (
+        first_result.financial_performance
+        == second_result.financial_performance
+    )
 
     assert first_result.performance.total_events == len(first_result.events)
     assert second_result.performance.total_events == len(second_result.events)
