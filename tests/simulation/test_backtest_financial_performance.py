@@ -121,7 +121,7 @@ def test_report_marks_active_inventory_at_each_event_reference_price() -> None:
     )
 
 
-def test_report_includes_vaulted_inventory_in_equity_marking() -> None:
+def test_active_report_excludes_vaulted_inventory_from_equity_marking() -> None:
     events = (
         make_event(
             sequence=1,
@@ -143,18 +143,11 @@ def test_report_includes_vaulted_inventory_in_equity_marking() -> None:
 
     report = build_report(events)
 
-    assert report.ending_equity == Decimal("1060")
-    assert report.net_pnl == Decimal("60")
-    assert report.return_rate == Decimal("0.06")
-    assert report.equity_curve[-1] == BacktestEquityPoint(
-        sequence=2,
-        equity=Decimal("1060"),
-        peak_equity=Decimal("1060"),
-        drawdown=Decimal("0"),
-    )
+    assert report.ending_equity == Decimal("700")
+    assert report.net_pnl == Decimal("-300")
 
 
-def test_report_marks_active_and_vaulted_inventory_together() -> None:
+def test_active_report_marks_only_active_inventory() -> None:
     events = (
         make_event(
             sequence=1,
@@ -167,10 +160,9 @@ def test_report_marks_active_and_vaulted_inventory_together() -> None:
 
     report = build_report(events)
 
-    # 500 cash + (4 active + 6 vaulted) * 50 reference price.
-    assert report.ending_equity == Decimal("1000")
-    assert report.net_pnl == Decimal("0")
-    assert report.return_rate == Decimal("0")
+    # Active-only: 500 cash + 4 active units × 50.
+    assert report.ending_equity == Decimal("700")
+    assert report.net_pnl == Decimal("-300")
 
 
 def test_report_tracks_peak_equity_and_maximum_drawdown() -> None:

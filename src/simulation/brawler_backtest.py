@@ -23,7 +23,9 @@ from src.simulation.session_snapshot import SimulationSessionSnapshot
 from src.strategies.brawler_strategy import BrawlerSettings
 from src.simulation.backtest_financial_performance import (
     BacktestFinancialPerformanceReport,
+    ConsolidatedBacktestFinancialPerformanceReport,
     build_backtest_financial_performance_report,
+    build_consolidated_backtest_financial_performance_report,
 )
 
 
@@ -34,6 +36,10 @@ class BrawlerBacktestResult:
     report: ReplayReport
     performance: BacktestPerformanceReport
     financial_performance: BacktestFinancialPerformanceReport
+    consolidated_financial_performance: (
+        ConsolidatedBacktestFinancialPerformanceReport
+    )
+
     execution_model: ExecutionModel
     final_snapshot: SimulationSessionSnapshot
     events: tuple[BacktestEvent, ...]
@@ -87,10 +93,22 @@ def run_brawler_backtest(
         starting_equity=session.config.initial_cash_balance,
     )
 
+    consolidated_financial_performance = (
+        build_consolidated_backtest_financial_performance_report(
+            immutable_events,
+            execution_model=execution_model,
+            starting_equity=session.config.initial_cash_balance,
+            vaulted_lots=session.vaulted_lots,
+            strategy_symbol=session.config.strategy_adapter.symbol,
+        )
+    )
+
+
     return BrawlerBacktestResult(
         report=build_replay_report(session),
         performance=build_backtest_performance_report(immutable_events),
         financial_performance=financial_performance,       
+        consolidated_financial_performance=consolidated_financial_performance,
         execution_model=execution_model,
         final_snapshot=SimulationSessionSnapshot.capture(session),
         events=immutable_events,
