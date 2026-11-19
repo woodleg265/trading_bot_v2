@@ -89,15 +89,22 @@ def test_backtest_returns_report_final_snapshot_and_performance(
 
     expected_ending_equity = (
         result.events[-1].cash_after
-        + (
-            result.events[-1].active_quantity_after
-            + result.events[-1].vaulted_quantity_after
-        )
+        + result.events[-1].active_quantity_after
         * result.events[-1].reference_price
         if result.events
         else session_config.initial_cash_balance
     )
 
+    assert (
+        result.consolidated_financial_performance.active_performance
+        == result.financial_performance
+    )
+    
+    assert (
+        result.consolidated_financial_performance.ending_equity
+        >= result.financial_performance.ending_equity
+    )
+    
     assert (
         result.financial_performance.ending_equity
         == expected_ending_equity
