@@ -10,7 +10,7 @@ from typing import Mapping
 def _require_utc_timestamp(value: datetime, field_name: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
-    if value.astimezone(timezone.utc).utcoffset() != timezone.utc.utcoffset(value):
+    if value.utcoffset() != timezone.utc.utcoffset(value):
         raise ValueError(f"{field_name} must use UTC")
 
 
